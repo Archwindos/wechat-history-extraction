@@ -1,0 +1,7 @@
+frida>=17,<18
+pycryptodome>=3.20
+zstandard>=0.22
+pillow>=10.4
+pymupdf>=1.25
+imageio-ffmpeg>=0.6,<0.7
+pywin32>=308; sys_platform == "win32"
