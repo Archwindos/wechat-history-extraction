@@ -133,8 +133,8 @@ def write_pdf(path, records, engine, chat, header, *, include_time=True, include
                 blocks.append(paragraph(header.rstrip(), r"\fontsize{11}{13}\selectfont\bfseries "))
                 blocks.append({"t": "RawBlock", "c": ["latex", r"\par\addvspace{6pt}"]})
             for index, record in enumerate(records, 1):
-                labels = ([record["time"]] if include_time else [])
-                if include_sender:
+                labels = ([record["time"]] if include_time and record.get("time") else [])
+                if include_sender and record.get("sender_name"):
                     labels.append(record["sender_name"])
                 if labels:
                     blocks.append(paragraph("  ".join(labels), r"\fontsize{7.5}{9}\selectfont\color{gray} "))
@@ -169,7 +169,7 @@ def write_pdf(path, records, engine, chat, header, *, include_time=True, include
                         counts["missing_videos"] += 1
                 else:
                     blocks.append(paragraph(record["content"]))
-                    if record.get("app"):
+                    if record.get("app") and not record.get("forwarded"):
                         image = media.cover(record)
                         if image:
                             blocks.append({"t": "RawBlock", "c": ["latex", r"\nopagebreak[4]"]})

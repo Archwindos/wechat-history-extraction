@@ -133,6 +133,11 @@ class LocalMedia:
             return None
 
     def _resource_ids(self, record):
+        if record.get("_forwarded_item"):
+            # Inner messages have their own identifiers; their local_id is not
+            # a row in the surrounding chat's message/resource database.
+            return [value.lower() for value in record.get("media_ids", [])
+                    if re.fullmatch(r"[0-9a-fA-F]{32}", value)]
         path = self.engine.snapshot / "message/message_resource.db"
         if not path.is_file():
             return []
@@ -157,22 +162,30 @@ class LocalMedia:
                 identifiers.extend(value.decode().lower() for value in re.findall(rb"[0-9a-fA-F]{32}", blob))
         return list(dict.fromkeys(identifiers))
 
-    def _registered_paths(self, identifiers, table, category):
+    def _registered_paths(self, identifiers, table, category, *, forwarded=False):
         path = self.engine.snapshot / "hardlink/hardlink.db"
         if not path.is_file():
             return []
         paths = []
         with read_connection(path) as connection:
+            if not connection.execute("SELECT 1 FROM sqlite_master WHERE name=?", (table,)).fetchone():
+                return []
+            columns = {row["name"] for row in connection.execute(f'PRAGMA table_info("{table}")')}
             for identifier in identifiers:
+                match = "lower(substr(h.file_name,1,32))=?"
+                parameters = [identifier]
+                if forwarded and "md5" in columns:
+                    match += " OR lower(h.md5)=?"
+                    parameters.append(identifier)
                 rows = connection.execute(f'SELECT h.file_name,d1.username,d2.username FROM "{table}" h '
                     'JOIN dir2id d1 ON d1.rowid=h.dir1 JOIN dir2id d2 ON d2.rowid=h.dir2 '
-                    'WHERE lower(substr(h.file_name,1,32))=?', (identifier,)).fetchall()
+                    'WHERE ' + match, parameters).fetchall()
                 for filename, directory, month in rows:
                     if any(not item or re.search(r"[/\\:\x00]", item) or item in (".", "..")
                            for item in (filename, directory, month)):
                         continue
                     if category == "Img":
-                        if directory != hashlib.md5(self.chat["wxid"].encode()).hexdigest():
+                        if not forwarded and directory != hashlib.md5(self.chat["wxid"].encode()).hexdigest():
                             continue
                         paths.append(self.account / "msg/attach" / directory / month / "Img" / filename)
                     else:
@@ -183,12 +196,17 @@ class LocalMedia:
 
     def image(self, record):
         identifiers = self._resource_ids(record)
-        paths = self._registered_paths(identifiers, "image_hardlink_info_v4", "Img")
+        forwarded = record.get("_forwarded_item", False)
+        paths = self._registered_paths(identifiers, "image_hardlink_info_v4", "Img", forwarded=forwarded)
         # Hardlink rows can be pruned while the actual files are still present.
         directory = hashlib.md5(self.chat["wxid"].encode()).hexdigest()
         root = self.account / "msg/attach" / directory
         for identifier in identifiers:
             paths.extend(root.glob("*/Img/" + identifier + "*"))
+            if forwarded:
+                # A forwarded picture can still be saved under its original
+                # conversation. Match its own IDs, never the outer card's image.
+                paths.extend((self.account / "msg/attach").glob("*/*/Img/" + identifier + "*"))
         # Windows often registers only the original; its JPEG thumbnails are siblings.
         for path in list(paths):
             identifier = path.stem.split("_")[0]
@@ -332,10 +350,10 @@ class LocalMedia:
                         identifiers.append(hashlib.md5(value.encode()).hexdigest())
                     if "thumb" in name and "md5" in name and re.fullmatch(r"[0-9a-fA-F]{32}", value):
                         identifiers.append(value.lower())
-        server_id = str(int(record["server_id"]) & ((1 << 64) - 1))
+        server_id = str(int(record["server_id"]) & ((1 << 64) - 1)) if str(record["server_id"]).lstrip("-").isdigit() else "0"
         if server_id != "0":
             identifiers.append(server_id)
-        month = datetime.fromtimestamp(record["timestamp"]).strftime("%Y-%m")
+        month = datetime.fromtimestamp(record["timestamp"]).strftime("%Y-%m") if record.get("timestamp") else ""
         directory = hashlib.md5(self.chat["wxid"].encode()).hexdigest()
         roots = [self.account / "cache" / month / "Message" / directory / "Thumb"]
         roots.extend((self.account / "cache").glob("*/Message/" + directory + "/Thumb"))

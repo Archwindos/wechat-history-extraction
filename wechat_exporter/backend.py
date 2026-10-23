@@ -314,6 +314,13 @@ class Engine:
                 parsed["summary"] = appmsg.format_app_message(parsed)
             content = f"[{parsed['label']}] {parsed['summary']}"
             extra["app"] = parsed
+            if parsed["kind"] in ("chat_history", "forwarded"):
+                from .forwarded import parse_forwarded
+                from .forwarded_export import card_text
+                bundle = parse_forwarded(original, row["local_type"], contacts.resolve_nickname)
+                if bundle is not None:
+                    extra["forwarded"] = bundle
+                    content = card_text(bundle)
         elif local_type in ("10000", "10002"):
             event = message.parse_system_message(original, default_event="recall" if local_type == "10002" else "")
             content = event["text"]
@@ -338,7 +345,10 @@ class Engine:
         return [self.record(row, chat) for row in self.iter_rows(chat, latest=count)]
 
     def export(self, chat, output, output_format="markdown", start="", end="", latest=None, log=lambda _: None,
-               *, sender_ids=None, include_time=True, include_sender=True, include_title=True):
+               *, sender_ids=None, include_time=True, include_sender=True, include_title=True,
+               forwarded_only=False):
+        from .forwarded_export import ForwardedWriter, display_record, json_record
+
         if output_format not in {"txt", "markdown", "html", "jsonl", "pdf"}:
             raise ValueError("不支持该导出格式。")
         output = Path(output).resolve()
@@ -347,19 +357,22 @@ class Engine:
         manifest_path = output.with_suffix(output.suffix + ".manifest.json")
         if manifest_path.exists():
             raise FileExistsError("同名校验文件已存在，请选择新文件名。")
+        forwarded_directory = output.with_name(output.name + "_转发记录")
         output.parent.mkdir(parents=True, exist_ok=True)
         count = 0
         first = last = None
         seen_ids = set()
-        header = f"与 {chat['name']} 的聊天记录\n" if include_title else ""
+        label = "合并转发索引" if forwarded_only else "聊天记录"
+        header = f"与 {chat['name']} 的{label}\n" if include_title else ""
         if include_time:
             header += f"导出时间：{datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
-        fd, temporary = tempfile.mkstemp(dir=output.parent, prefix=".wechat-export-", suffix=".tmp")
         media_counts = {}
         def records():
             nonlocal count, first, last
             for row in self.iter_rows(chat, start, end, latest, sender_ids):
                 record = self.record(row, chat)
+                if forwarded_only and "forwarded" not in record:
+                    continue
                 if record["record_id"] in seen_ids:
                     raise RuntimeError("发现重复的本地消息标识，已停止导出以避免结果不准确。")
                 seen_ids.add(record["record_id"])
@@ -368,47 +381,58 @@ class Engine:
                 last = record["timestamp"]
                 if count % 1000 == 0:
                     log(f"已导出 {count:,} 条")
-                yield record
-        def displayed(record):
-            metadata = ([f"[{record['time']}]"] if include_time else [])
-            if include_sender:
-                metadata.append(f"[{record['sender_name']}]")
-            return " ".join(metadata + [record["content"]])
-        try:
+                yield forwards.separate(record)
+        with tempfile.TemporaryDirectory(dir=output.parent, prefix=".wechat-export-") as temporary:
+            staging = Path(temporary)
+            staged_output = staging / ("transcript" + output.suffix)
+            forwards = ForwardedWriter(staging / "forwards", forwarded_directory.name, output_format,
+                self, chat, include_time=include_time, include_sender=include_sender,
+                include_title=include_title, log=log)
             if output_format == "pdf":
-                os.close(fd)
                 from .pdf_export import write_pdf
-                media_counts = write_pdf(temporary, records(), self, chat, header,
+                media_counts = write_pdf(staged_output, records(), self, chat, header,
                                          include_time=include_time, include_sender=include_sender, log=log)
+                for entry in forwards.files:
+                    for key, value in entry.get("media", {}).items():
+                        media_counts[key] = media_counts.get(key, 0) + value
             else:
-                with os.fdopen(fd, "w", encoding="utf-8", newline="") as destination:
+                with staged_output.open("x", encoding="utf-8", newline="") as destination:
                     if output_format == "jsonl":
                         for record in records():
-                            if not include_time:
-                                for key in ("time", "timestamp"):
-                                    record.pop(key)
-                            if not include_sender:
-                                for key in ("sender_id", "sender_name", "is_self"):
-                                    record.pop(key)
-                            destination.write(json.dumps(record, ensure_ascii=False) + "\n")
+                            destination.write(json.dumps(json_record(record, include_time, include_sender), ensure_ascii=False) + "\n")
                     else:
-                        destination.writelines(transcript_render.render(header, ((displayed(r), None) for r in records()), output_format))
+                        destination.writelines(transcript_render.render(header,
+                            ((display_record(r, include_time, include_sender), None) for r in records()), output_format))
                     destination.flush()
                     os.fsync(destination.fileno())
-            # Windows rename refuses to replace a file created during the export.
-            os.rename(temporary, output)
-        except BaseException:
-            Path(temporary).unlink(missing_ok=True)
-            raise
-        manifest = {"schema": "wechat-export-manifest-v1", "conversation": chat["name"],
+            manifest = {"schema": "wechat-export-manifest-v1", "conversation": chat["name"],
                     "conversation_id": chat["wxid"], "count": count, "first_timestamp": first if include_time else None,
                     "last_timestamp": last if include_time else None, "format": output_format, "file": output.name,
-                    "sha256": sha256_file(output), "snapshot_captured_at": self.settings.get("captured_at"),
+                    "sha256": sha256_file(staged_output), "snapshot_captured_at": self.settings.get("captured_at"),
                     "start": start or None, "end": end or None, "latest": latest,
                     "source_shards": [p.name for p in numbered_shards(self.snapshot)],
                     "sender_filter_applied": sender_ids is not None, "include_time": include_time,
                     "include_sender": include_sender, "include_title": include_title,
+                    "forwarded_only": forwarded_only, "forwarded_count": len(forwards.files),
+                    "forwarded_directory": str(forwarded_directory) if forwards.files else None,
+                    "forwarded_missing": forwards.missing, "forwarded_files": forwards.files,
                     "media": media_counts or "Image, voice and video are represented by explicit placeholders in this version."}
-        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+            staged_manifest = staging / "manifest.json"
+            staged_manifest.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+            moves = [(staged_output, output), (staged_manifest, manifest_path)]
+            if forwards.files:
+                moves.insert(0, (forwards.folder, forwarded_directory))
+            if any(target.exists() for _, target in moves):
+                raise FileExistsError("导出文件或转发记录目录已存在，请选择新文件名。")
+            published = []
+            try:
+                for source, target in moves:
+                    # Windows rename refuses to overwrite a file created during export.
+                    os.rename(source, target)
+                    published.append((source, target))
+            except BaseException:
+                for source, target in reversed(published):
+                    os.rename(target, source)
+                raise
         log(f"导出完成：{count:,} 条，校验文件已生成。")
         return {"path": str(output), "manifest": str(manifest_path), **manifest}
